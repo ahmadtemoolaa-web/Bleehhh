@@ -106,10 +106,10 @@ jobs:
           namespace cfg {
           // Air absorption (distances are in blocks)
           constexpr bool  kAirAbsorption   = true;
-          constexpr float kAirStart        = 5.0f;   // no muffling closer than this
-          constexpr float kAirFull         = 24.0f;  // max muffling at/after this
-          constexpr float kAirMax          = 0.45f;  // 0..1, FMOD direct occlusion at max
-          constexpr float kAirCurve        = 1.4f;   // >1 = muffling grows slowly at first
+          constexpr float kAirStart        = 2.0f;   // no muffling closer than this
+          constexpr float kAirFull         = 16.0f;  // max muffling at/after this
+          constexpr float kAirMax          = 0.85f;  // 0..1, FMOD direct occlusion at max
+          constexpr float kAirCurve        = 1.0f;   // >1 = muffling grows slowly at first
           constexpr float kReverbOccFactor = 0.25f;  // how much of the above hits the reverb path
 
           // Depth reverb (Y coordinate in blocks)
@@ -197,7 +197,9 @@ jobs:
             p.HighCut           = 20000.0f;
             p.EarlyLateMix      = 70.0f;
             p.WetLevel          = lerp(cfg::kWetSurfaceDb, cfg::kWetCaveDb, g_cave);
-            f_sysReverb(sys, 0, &p);
+            FMOD_RESULT rr = f_sysReverb(sys, 0, &p);
+            LOGI("reverb update: y=%.1f cave=%.2f wet=%.1fdB decay=%.0fms result=%d", listenerY,
+                 g_cave, p.WetLevel, p.DecayTime, rr);
           }
 
           // ---------------------------------------------------------------- hooks
@@ -208,7 +210,7 @@ jobs:
             if (shouldLog(c_listener))
               LOGI("listener#%u idx=%d pos=(%.1f,%.1f,%.1f)", c_listener.load(), idx,
                    pos ? pos->x : 0.f, pos ? pos->y : 0.f, pos ? pos->z : 0.f);
-            if (idx == 0 && pos) {
+            if (idx == 0 && pos && !(pos->x == 0.0f && pos->y == 0.0f && pos->z == 0.0f)) {
               float y;
               {
                 std::lock_guard<std::mutex> lk(g_mu);
@@ -404,7 +406,7 @@ jobs:
             }
 
             f_occ       = (Fn_Set3DOcc)findFmod("_ZN4FMOD14ChannelControl14set3DOcclusionEff");
-            f_sysReverb = (Fn_SysReverb)findFmod("_ZN4FMOD6System19setReverbPropertiesEiPK21FMOD_REVERB_PROPERTIES");
+            f_sysReverb = (Fn_SysReverb)findFmod("_ZN4FMOD6System19setReverbPropertiesEiPK22FMOD_REVERB_PROPERTIES");
             f_chReverb  = (Fn_ChReverb)findFmod("_ZN4FMOD14ChannelControl19setReverbPropertiesEif");
             f_getMaster = (Fn_GetMaster)findFmod("_ZN4FMOD6System21getMasterChannelGroupEPPNS_12ChannelGroupE");
 
@@ -429,7 +431,7 @@ jobs:
           static std::atomic<bool> g_started{false};
           static void startOnce(const char* how) {
             if (g_started.exchange(true)) return;
-            LOGI("SoundPhysicsLite build 2 starting via %s (pid %d)", how, (int)getpid());
+            LOGI("SoundPhysicsLite build 3 starting via %s (pid %d)", how, (int)getpid());
             if (!tryInstall()) std::thread(retryThread).detach();
           }
 
