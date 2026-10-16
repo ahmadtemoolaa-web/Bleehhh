@@ -44,6 +44,11 @@ jobs:
           #include <unistd.h>
 
           #include <atomic>
+          #include <cstdarg>
+          #include <cstdio>
+          #include <jni.h>
+          #include <string>
+          #include <vector>
           #include <chrono>
           #include <cmath>
           #include <cstdint>
@@ -54,8 +59,48 @@ jobs:
           #include <unordered_set>
 
           #define TAG "SoundPhysicsLite"
-          #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
-          #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, TAG, __VA_ARGS__)
+
+          // Log to logcat AND to spl_log.txt (several candidate folders) so problems can
+          // be diagnosed without a PC.
+          static void spl_log(const char* fmt, ...) {
+            char buf[600];
+            va_list ap;
+            va_start(ap, fmt);
+            vsnprintf(buf, sizeof buf, fmt, ap);
+            va_end(ap);
+            __android_log_print(ANDROID_LOG_INFO, TAG, "%s", buf);
+            static std::mutex m;
+            std::lock_guard<std::mutex> lk(m);
+            static std::vector<std::string> paths;
+            static bool init = false;
+            if (!init) {
+              init = true;
+              char pkg[256] = {0};
+              if (FILE* f = fopen("/proc/self/cmdline", "r")) {
+                size_t n = fread(pkg, 1, sizeof(pkg) - 1, f);
+                (void)n;
+                fclose(f);
+              }
+              if (pkg[0])
+                paths.push_back(std::string("/storage/emulated/0/Android/data/") + pkg + "/files/spl_log.txt");
+              paths.push_back("/storage/emulated/0/games/spl_log.txt");
+              paths.push_back("/storage/emulated/0/Download/spl_log.txt");
+            }
+            for (auto& path : paths) {
+              if (FILE* f = fopen(path.c_str(), "a")) {
+                fprintf(f, "%s\n", buf);
+                fclose(f);
+              }
+            }
+          }
+          #define LOGI(...) spl_log(__VA_ARGS__)
+          #define LOGW(...) spl_log(__VA_ARGS__)
+
+          static std::atomic<unsigned> c_listener{0}, c_play{0}, c_set3D{0};
+          static bool shouldLog(std::atomic<unsigned>& c) {
+            unsigned n = ++c;
+            return n <= 3 || n % 3000 == 0;
+          }
 
           // ---------------------------------------------------------------- settings
           namespace cfg {
@@ -160,6 +205,9 @@ jobs:
                                          const FMOD_VECTOR* vel, const FMOD_VECTOR* fwd,
                                          const FMOD_VECTOR* up) {
             FMOD_RESULT r = o_listener(sys, idx, pos, vel, fwd, up);
+            if (shouldLog(c_listener))
+              LOGI("listener#%u idx=%d pos=(%.1f,%.1f,%.1f)", c_listener.load(), idx,
+                   pos ? pos->x : 0.f, pos ? pos->y : 0.f, pos ? pos->z : 0.f);
             if (idx == 0 && pos) {
               float y;
               {
@@ -175,6 +223,7 @@ jobs:
 
           static FMOD_RESULT hk_play(void* sys, void* snd, void* grp, bool paused, void** chOut) {
             FMOD_RESULT r = o_play(sys, snd, grp, paused, chOut);
+            if (shouldLog(c_play)) LOGI("playSound#%u result=%d", c_play.load(), r);
             if (g_reverbOk && f_chReverb) {
               // Make sure ONLY channels that get 3D attributes feed the reverb
               // (keeps music and UI sounds clean).
@@ -215,8 +264,13 @@ jobs:
               if (first && g_reverbOk && f_chReverb) f_chReverb(ch, 0, 1.0f);
               if (cfg::kAirAbsorption && f_occ) {
                 float dx = pos->x - lis.x, dy = pos->y - lis.y, dz = pos->z - lis.z;
-                float occ = airOcclusion(std::sqrt(dx * dx + dy * dy + dz * dz));
-                f_occ(ch, occ, occ * cfg::kReverbOccFactor);
+                float dist = std::sqrt(dx * dx + dy * dy + dz * dz);
+                float occ = airOcclusion(dist);
+                FMOD_RESULT orr = f_occ(ch, occ, occ * cfg::kReverbOccFactor);
+                if (shouldLog(c_set3D))
+                  LOGI("set3D#%u dist=%.1f occ=%.2f occResult=%d", c_set3D.load(), dist, occ, orr);
+              } else if (shouldLog(c_set3D)) {
+                LOGI("set3D#%u (no occlusion fn)", c_set3D.load());
               }
             }
             return r;
@@ -252,6 +306,7 @@ jobs:
             if (!name || !strstr(name, "libminecraftpe.so")) return 0;
 
             uintptr_t bias = info->dlpi_addr;
+            LOGI("found module: %s bias=%p", name, (void*)bias);
             const ElfW(Dyn)* dyn = nullptr;
             for (int i = 0; i < info->dlpi_phnum; i++) {
               if (info->dlpi_phdr[i].p_type == PT_DYNAMIC) {
@@ -299,6 +354,7 @@ jobs:
                   if (!*g_hooks[h].orig) *g_hooks[h].orig = *slot;
                   writeSlot(slot, g_hooks[h].hook);
                   g_hooks[h].done = true;
+                  LOGI("patched %s slot=%p orig=%p", nm, (void*)slot, *g_hooks[h].orig);
                 }
               }
             };
@@ -317,11 +373,24 @@ jobs:
 
           static std::atomic<bool> g_installed{false};
 
+          static int listCallback(struct dl_phdr_info* info, size_t, void*) {
+            const char* n = info->dlpi_name;
+            if (n && (strstr(n, "fmod") || strstr(n, "minecraft") || strstr(n, "soundphysics")))
+              LOGI("loaded lib: %s", n);
+            return 0;
+          }
+
           static bool tryInstall() {
             if (g_installed.load()) return true;
+            static bool listed = false;
+            if (!listed) { listed = true; dl_iterate_phdr(listCallback, nullptr); }
             bool found = false;
             dl_iterate_phdr(phdrCallback, &found);
-            if (!found) return false;
+            if (!found) {
+              static bool warned = false;
+              if (!warned) { warned = true; LOGW("libminecraftpe.so not loaded yet, will retry"); }
+              return false;
+            }
 
             int ok = 0;
             for (int h = 0; h < kNumHooks; h++) {
@@ -343,6 +412,8 @@ jobs:
             g_reverbOk = f_sysReverb && f_chReverb && f_getMaster && o_play && o_set3D && o_listener;
             LOGI("installed: hooks=%d/%d occlusion=%s reverb=%s", ok, kNumHooks,
                  f_occ ? "yes" : "NO", g_reverbOk ? "yes" : "NO");
+            LOGI("fn ptrs: occ=%p sysReverb=%p chReverb=%p master=%p", (void*)f_occ,
+                 (void*)f_sysReverb, (void*)f_chReverb, (void*)f_getMaster);
             g_installed = true;
             return true;
           }
@@ -355,9 +426,18 @@ jobs:
             if (!g_installed.load()) LOGW("libminecraftpe.so not found, giving up");
           }
 
-          __attribute__((constructor)) static void spl_init() {
-            LOGI("SoundPhysicsLite loading");
+          static std::atomic<bool> g_started{false};
+          static void startOnce(const char* how) {
+            if (g_started.exchange(true)) return;
+            LOGI("SoundPhysicsLite build 2 starting via %s (pid %d)", how, (int)getpid());
             if (!tryInstall()) std::thread(retryThread).detach();
+          }
+
+          __attribute__((constructor)) static void spl_init() { startOnce("constructor"); }
+
+          extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM*, void*) {
+            startOnce("JNI_OnLoad");
+            return JNI_VERSION_1_6;
           }
           EOF
       - name: Build (arm64-v8a)
