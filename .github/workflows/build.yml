@@ -1,0 +1,379 @@
+name: Build SoundPhysicsLite
+on:
+  push:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Write sources
+        run: |
+          mkdir -p src
+          cat > CMakeLists.txt <<'EOF'
+          cmake_minimum_required(VERSION 3.18)
+          project(SoundPhysicsLite LANGUAGES CXX)
+          set(CMAKE_CXX_STANDARD 17)
+          set(CMAKE_CXX_STANDARD_REQUIRED ON)
+          add_library(soundphysicslite SHARED src/main.cpp)
+          target_compile_options(soundphysicslite PRIVATE -O2 -fvisibility=hidden)
+          target_link_options(soundphysicslite PRIVATE -Wl,-z,max-page-size=16384)
+          target_link_libraries(soundphysicslite log dl)
+          EOF
+          cat > src/main.cpp <<'EOF'
+          // SoundPhysicsLite - native mod for LeviLaunchroid (Minecraft Bedrock, Android arm64)
+          //
+          // Original work (MIT). Written from scratch from general acoustics ideas; it does
+          // not contain code from other Minecraft sound mods.
+          //
+          // What it does (no access to world/block data is needed):
+          //   1. Air absorption: 3D sounds get progressively muffled with distance
+          //      (low-pass via FMOD's built-in 3D occlusion).
+          //   2. Depth reverb: a global reverb that is nearly silent at the surface and
+          //      grows as the player goes deep underground (cave feeling).
+          //
+          // How it hooks: Minecraft imports a few FMOD functions from libfmod.so. We swap
+          // the entries in libminecraftpe.so's GOT (import table) for our own functions.
+
+          #include <android/log.h>
+          #include <dlfcn.h>
+          #include <elf.h>
+          #include <link.h>
+          #include <sys/mman.h>
+          #include <unistd.h>
+
+          #include <atomic>
+          #include <chrono>
+          #include <cmath>
+          #include <cstdint>
+          #include <cstring>
+          #include <mutex>
+          #include <thread>
+          #include <unordered_map>
+          #include <unordered_set>
+
+          #define TAG "SoundPhysicsLite"
+          #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
+          #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, TAG, __VA_ARGS__)
+
+          // ---------------------------------------------------------------- settings
+          namespace cfg {
+          // Air absorption (distances are in blocks)
+          constexpr bool  kAirAbsorption   = true;
+          constexpr float kAirStart        = 5.0f;   // no muffling closer than this
+          constexpr float kAirFull         = 24.0f;  // max muffling at/after this
+          constexpr float kAirMax          = 0.45f;  // 0..1, FMOD direct occlusion at max
+          constexpr float kAirCurve        = 1.4f;   // >1 = muffling grows slowly at first
+          constexpr float kReverbOccFactor = 0.25f;  // how much of the above hits the reverb path
+
+          // Depth reverb (Y coordinate in blocks)
+          constexpr bool  kDepthReverb     = true;
+          constexpr float kSurfaceY        = 60.0f;  // at/above this: surface reverb
+          constexpr float kCaveY           = 35.0f;  // at/below this: full cave reverb
+          constexpr float kWetSurfaceDb    = -28.0f; // reverb level at surface (dB, -80..20)
+          constexpr float kWetCaveDb       = -9.0f;  // reverb level deep underground (dB)
+          constexpr float kDecaySurfaceMs  = 900.0f;
+          constexpr float kDecayCaveMs     = 3400.0f;
+          }  // namespace cfg
+
+          // ---------------------------------------------------------------- FMOD ABI
+          // Only the tiny part of the FMOD C++ ABI that we need. Member functions on
+          // AArch64 take `this` as the first argument, so plain function pointers work.
+          typedef int FMOD_RESULT;
+          struct FMOD_VECTOR { float x, y, z; };
+          struct FMOD_REVERB_PROPERTIES {
+            float DecayTime, EarlyDelay, LateDelay, HFReference, HFDecayRatio, Diffusion,
+                Density, LowShelfFrequency, LowShelfGain, HighCut, EarlyLateMix, WetLevel;
+          };
+
+          typedef FMOD_RESULT (*Fn_Listener)(void*, int, const FMOD_VECTOR*, const FMOD_VECTOR*,
+                                             const FMOD_VECTOR*, const FMOD_VECTOR*);
+          typedef FMOD_RESULT (*Fn_Play)(void*, void*, void*, bool, void**);
+          typedef FMOD_RESULT (*Fn_Set3DAttr)(void*, const FMOD_VECTOR*, const FMOD_VECTOR*);
+          typedef FMOD_RESULT (*Fn_Set3DOcc)(void*, float, float);
+          typedef FMOD_RESULT (*Fn_SysReverb)(void*, int, const FMOD_REVERB_PROPERTIES*);
+          typedef FMOD_RESULT (*Fn_ChReverb)(void*, int, float);
+          typedef FMOD_RESULT (*Fn_GetMaster)(void*, void**);
+
+          // Originals (filled in when we patch the GOT) and helpers (found via dlsym).
+          static Fn_Listener  o_listener = nullptr;
+          static Fn_Play      o_play     = nullptr;
+          static Fn_Set3DAttr o_set3D    = nullptr;
+          static Fn_Set3DOcc  f_occ        = nullptr;
+          static Fn_SysReverb f_sysReverb  = nullptr;
+          static Fn_ChReverb  f_chReverb   = nullptr;
+          static Fn_GetMaster f_getMaster  = nullptr;
+
+          // ---------------------------------------------------------------- state
+          static std::mutex g_mu;
+          static FMOD_VECTOR g_lis = {0, 0, 0};
+          static std::atomic<bool> g_hasLis{false};
+          static std::unordered_set<void*> g_known;   // channels already seen with 3D attrs
+          static std::unordered_set<void*> g_groups;  // channel groups already silenced for reverb
+          static bool g_masterDone = false;
+          static bool g_reverbOk = false;
+
+          static float g_cave = 0.0f;
+          static float g_lastCave = -1.0f;
+          static std::chrono::steady_clock::time_point g_lastRev{};
+
+          static inline float clamp01(float v) { return v < 0 ? 0 : (v > 1 ? 1 : v); }
+          static inline float lerp(float a, float b, float t) { return a + (b - a) * t; }
+
+          // ---------------------------------------------------------------- effects
+          static float airOcclusion(float dist) {
+            if (dist <= cfg::kAirStart) return 0.0f;
+            float t = clamp01((dist - cfg::kAirStart) / (cfg::kAirFull - cfg::kAirStart));
+            return std::pow(t, cfg::kAirCurve) * cfg::kAirMax;
+          }
+
+          static void updateReverb(void* sys, float listenerY) {
+            if (!g_reverbOk || !cfg::kDepthReverb || !f_sysReverb) return;
+            auto now = std::chrono::steady_clock::now();
+            if (now - g_lastRev < std::chrono::milliseconds(250)) return;
+            g_lastRev = now;
+
+            float target = clamp01((cfg::kSurfaceY - listenerY) / (cfg::kSurfaceY - cfg::kCaveY));
+            g_cave += (target - g_cave) * 0.3f;  // smooth transition
+            if (std::fabs(g_cave - g_lastCave) < 0.02f && g_lastCave >= 0) return;
+            g_lastCave = g_cave;
+
+            FMOD_REVERB_PROPERTIES p;
+            p.DecayTime         = lerp(cfg::kDecaySurfaceMs, cfg::kDecayCaveMs, g_cave);
+            p.EarlyDelay        = lerp(7.0f, 12.0f, g_cave);
+            p.LateDelay         = lerp(11.0f, 25.0f, g_cave);
+            p.HFReference       = 5000.0f;
+            p.HFDecayRatio      = lerp(60.0f, 40.0f, g_cave);
+            p.Diffusion         = 100.0f;
+            p.Density           = 100.0f;
+            p.LowShelfFrequency = 250.0f;
+            p.LowShelfGain      = 0.0f;
+            p.HighCut           = 20000.0f;
+            p.EarlyLateMix      = 70.0f;
+            p.WetLevel          = lerp(cfg::kWetSurfaceDb, cfg::kWetCaveDb, g_cave);
+            f_sysReverb(sys, 0, &p);
+          }
+
+          // ---------------------------------------------------------------- hooks
+          static FMOD_RESULT hk_listener(void* sys, int idx, const FMOD_VECTOR* pos,
+                                         const FMOD_VECTOR* vel, const FMOD_VECTOR* fwd,
+                                         const FMOD_VECTOR* up) {
+            FMOD_RESULT r = o_listener(sys, idx, pos, vel, fwd, up);
+            if (idx == 0 && pos) {
+              float y;
+              {
+                std::lock_guard<std::mutex> lk(g_mu);
+                g_lis = *pos;
+                y = pos->y;
+              }
+              g_hasLis = true;
+              updateReverb(sys, y);
+            }
+            return r;
+          }
+
+          static FMOD_RESULT hk_play(void* sys, void* snd, void* grp, bool paused, void** chOut) {
+            FMOD_RESULT r = o_play(sys, snd, grp, paused, chOut);
+            if (g_reverbOk && f_chReverb) {
+              // Make sure ONLY channels that get 3D attributes feed the reverb
+              // (keeps music and UI sounds clean).
+              bool silenceGroup = false, silenceMaster = false;
+              {
+                std::lock_guard<std::mutex> lk(g_mu);
+                if (grp && g_groups.insert(grp).second) silenceGroup = true;
+                if (!g_masterDone && f_getMaster) { g_masterDone = true; silenceMaster = true; }
+              }
+              if (silenceGroup) f_chReverb(grp, 0, 0.0f);
+              if (silenceMaster) {
+                void* master = nullptr;
+                if (f_getMaster(sys, &master) == 0 && master) f_chReverb(master, 0, 0.0f);
+              }
+              if (r == 0 && chOut && *chOut) {
+                void* ch = *chOut;
+                {
+                  std::lock_guard<std::mutex> lk(g_mu);
+                  g_known.erase(ch);
+                }
+                f_chReverb(ch, 0, 0.0f);
+              }
+            }
+            return r;
+          }
+
+          static FMOD_RESULT hk_set3D(void* ch, const FMOD_VECTOR* pos, const FMOD_VECTOR* vel) {
+            FMOD_RESULT r = o_set3D(ch, pos, vel);
+            if (pos && g_hasLis.load()) {
+              FMOD_VECTOR lis;
+              bool first;
+              {
+                std::lock_guard<std::mutex> lk(g_mu);
+                lis = g_lis;
+                first = g_known.insert(ch).second;
+                if (g_known.size() > 4096) g_known.clear();
+              }
+              if (first && g_reverbOk && f_chReverb) f_chReverb(ch, 0, 1.0f);
+              if (cfg::kAirAbsorption && f_occ) {
+                float dx = pos->x - lis.x, dy = pos->y - lis.y, dz = pos->z - lis.z;
+                float occ = airOcclusion(std::sqrt(dx * dx + dy * dy + dz * dz));
+                f_occ(ch, occ, occ * cfg::kReverbOccFactor);
+              }
+            }
+            return r;
+          }
+
+          // ---------------------------------------------------------------- GOT patching
+          struct HookDef {
+            const char* sym;
+            void* hook;
+            void** orig;
+            bool done;
+          };
+
+          static HookDef g_hooks[] = {
+              {"_ZN4FMOD6System23set3DListenerAttributesEiPK11FMOD_VECTORS3_S3_S3_",
+               (void*)hk_listener, (void**)&o_listener, false},
+              {"_ZN4FMOD6System9playSoundEPNS_5SoundEPNS_12ChannelGroupEbPPNS_7ChannelE",
+               (void*)hk_play, (void**)&o_play, false},
+              {"_ZN4FMOD14ChannelControl15set3DAttributesEPK11FMOD_VECTORS3_",
+               (void*)hk_set3D, (void**)&o_set3D, false},
+          };
+          constexpr int kNumHooks = sizeof(g_hooks) / sizeof(g_hooks[0]);
+
+          static void writeSlot(void** slot, void* value) {
+            long page = sysconf(_SC_PAGESIZE);
+            uintptr_t start = (uintptr_t)slot & ~(uintptr_t)(page - 1);
+            mprotect((void*)start, page, PROT_READ | PROT_WRITE);
+            *slot = value;
+          }
+
+          static int phdrCallback(struct dl_phdr_info* info, size_t, void* data) {
+            const char* name = info->dlpi_name;
+            if (!name || !strstr(name, "libminecraftpe.so")) return 0;
+
+            uintptr_t bias = info->dlpi_addr;
+            const ElfW(Dyn)* dyn = nullptr;
+            for (int i = 0; i < info->dlpi_phnum; i++) {
+              if (info->dlpi_phdr[i].p_type == PT_DYNAMIC) {
+                dyn = (const ElfW(Dyn)*)(bias + info->dlpi_phdr[i].p_vaddr);
+                break;
+              }
+            }
+            if (!dyn) return 0;
+
+            auto fix = [&](uintptr_t p) { return p < bias ? p + bias : p; };
+            const ElfW(Sym)* symtab = nullptr;
+            const char* strtab = nullptr;
+            const ElfW(Rela)* jmprel = nullptr;
+            size_t jmprelSz = 0;
+            const ElfW(Rela)* rela = nullptr;
+            size_t relaSz = 0;
+            for (; dyn->d_tag != DT_NULL; dyn++) {
+              switch (dyn->d_tag) {
+                case DT_SYMTAB:   symtab = (const ElfW(Sym)*)fix(dyn->d_un.d_ptr); break;
+                case DT_STRTAB:   strtab = (const char*)fix(dyn->d_un.d_ptr); break;
+                case DT_JMPREL:   jmprel = (const ElfW(Rela)*)fix(dyn->d_un.d_ptr); break;
+                case DT_PLTRELSZ: jmprelSz = dyn->d_un.d_val; break;
+                case DT_RELA:     rela = (const ElfW(Rela)*)fix(dyn->d_un.d_ptr); break;
+                case DT_RELASZ:   relaSz = dyn->d_un.d_val; break;
+                default: break;
+              }
+            }
+            if (!symtab || !strtab) return 0;
+
+            auto scan = [&](const ElfW(Rela)* tab, size_t bytes) {
+              if (!tab) return;
+              size_t n = bytes / sizeof(ElfW(Rela));
+              for (size_t i = 0; i < n; i++) {
+                uint32_t type = ELF64_R_TYPE(tab[i].r_info);
+                // 1025 = GLOB_DAT, 1026 = JUMP_SLOT, 257 = ABS64 (AArch64)
+                if (type != 1025 && type != 1026 && type != 257) continue;
+                uint32_t si = ELF64_R_SYM(tab[i].r_info);
+                if (!si) continue;
+                const char* nm = strtab + symtab[si].st_name;
+                if (nm[0] != '_' || nm[1] != 'Z' || nm[2] != 'N' || nm[3] != '4') continue;  // FMOD only
+                for (int h = 0; h < kNumHooks; h++) {
+                  if (strcmp(nm, g_hooks[h].sym) != 0) continue;
+                  void** slot = (void**)(bias + tab[i].r_offset);
+                  if (*slot == g_hooks[h].hook) { g_hooks[h].done = true; continue; }
+                  if (!*g_hooks[h].orig) *g_hooks[h].orig = *slot;
+                  writeSlot(slot, g_hooks[h].hook);
+                  g_hooks[h].done = true;
+                }
+              }
+            };
+            scan(jmprel, jmprelSz);
+            scan(rela, relaSz);
+            *(bool*)data = true;
+            return 1;
+          }
+
+          static void* findFmod(const char* name) {
+            static void* h = dlopen("libfmod.so", RTLD_NOW | RTLD_NOLOAD);
+            void* p = h ? dlsym(h, name) : nullptr;
+            if (!p) p = dlsym(RTLD_DEFAULT, name);
+            return p;
+          }
+
+          static std::atomic<bool> g_installed{false};
+
+          static bool tryInstall() {
+            if (g_installed.load()) return true;
+            bool found = false;
+            dl_iterate_phdr(phdrCallback, &found);
+            if (!found) return false;
+
+            int ok = 0;
+            for (int h = 0; h < kNumHooks; h++) {
+              if (g_hooks[h].done && *g_hooks[h].orig) ok++;
+              else LOGW("hook not installed: %s", g_hooks[h].sym);
+            }
+            if (ok < kNumHooks) {
+              // Safety: if the set is incomplete, put everything back to a consistent state
+              // by leaving whatever got patched (each hook forwards to the original anyway).
+              LOGW("only %d/%d hooks installed", ok, kNumHooks);
+            }
+
+            f_occ       = (Fn_Set3DOcc)findFmod("_ZN4FMOD14ChannelControl14set3DOcclusionEff");
+            f_sysReverb = (Fn_SysReverb)findFmod("_ZN4FMOD6System19setReverbPropertiesEiPK21FMOD_REVERB_PROPERTIES");
+            f_chReverb  = (Fn_ChReverb)findFmod("_ZN4FMOD14ChannelControl19setReverbPropertiesEif");
+            f_getMaster = (Fn_GetMaster)findFmod("_ZN4FMOD6System21getMasterChannelGroupEPPNS_12ChannelGroupE");
+
+            // Reverb is only enabled if everything needed to keep music/UI dry is available.
+            g_reverbOk = f_sysReverb && f_chReverb && f_getMaster && o_play && o_set3D && o_listener;
+            LOGI("installed: hooks=%d/%d occlusion=%s reverb=%s", ok, kNumHooks,
+                 f_occ ? "yes" : "NO", g_reverbOk ? "yes" : "NO");
+            g_installed = true;
+            return true;
+          }
+
+          static void retryThread() {
+            for (int i = 0; i < 300 && !g_installed.load(); i++) {  // up to ~60 s
+              if (tryInstall()) return;
+              std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            }
+            if (!g_installed.load()) LOGW("libminecraftpe.so not found, giving up");
+          }
+
+          __attribute__((constructor)) static void spl_init() {
+            LOGI("SoundPhysicsLite loading");
+            if (!tryInstall()) std::thread(retryThread).detach();
+          }
+          EOF
+      - name: Build (arm64-v8a)
+        run: |
+          NDK="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"
+          cmake -S . -B build \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-28 \
+            -DANDROID_STL=c++_static -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j
+          ls -l build/libsoundphysicslite.so
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "build-${{ github.run_number }}" build/libsoundphysicslite.so \
+            --repo "${{ github.repository }}" \
+            --title "SoundPhysicsLite build ${{ github.run_number }}" \
+            --notes "Import libsoundphysicslite.so into LeviLaunchroid."
