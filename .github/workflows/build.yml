@@ -21,47 +21,89 @@ jobs:
           target_link_options(soundphysicslite PRIVATE -Wl,-z,max-page-size=16384)
           target_link_libraries(soundphysicslite log dl)
           EOF
+          cat > THIRD_PARTY.txt <<'EOF'
+          SoundPhysicsLite third-party notices
+          ====================================
+
+          BedrockTools (https://github.com/QYCottage/BedrockTools)
+          Used for: two function signatures (byte patterns) that locate
+          ClientInstance::getLocalPlayer and BlockSource::isSolidBlockingBlock in
+          libminecraftpe.so, and the vtable slot numbers (31 = getRegion, 32 = getLocalPlayer)
+          of ClientInstance.
+
+          MIT License
+
+          Copyright (c) 2026 RadiantByte
+
+          Permission is hereby granted, free of charge, to any person obtaining a copy
+          of this software and associated documentation files (the "Software"), to deal
+          in the Software without restriction, including without limitation the rights
+          to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+          copies of the Software, and to permit persons to whom the Software is
+          furnished to do so, subject to the following conditions:
+
+          The above copyright notice and this permission notice shall be included in all
+          copies or substantial portions of the Software.
+
+          THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+          IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+          FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+          AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+          LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+          OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+          SOFTWARE.
+          EOF
           cat > src/main.cpp <<'EOF'
           // SoundPhysicsLite - native mod for LeviLaunchroid (Minecraft Bedrock, Android arm64)
           //
-          // Original work (MIT). Written from scratch from general acoustics ideas; it does
-          // not contain code from other Minecraft sound mods.
+          // Original work (MIT). The acoustic model is written from scratch from general
+          // ideas (ray casting through blocks); it contains no code from other sound mods.
           //
-          // What it does (no access to world/block data is needed):
-          //   1. Air absorption: 3D sounds get progressively muffled with distance
-          //      (low-pass via FMOD's built-in 3D occlusion).
-          //   2. Depth reverb: a global reverb that is nearly silent at the surface and
-          //      grows as the player goes deep underground (cave feeling).
+          // Credit: the two function signatures (byte patterns) used to locate Minecraft's
+          // ClientInstance::getLocalPlayer and BlockSource::isSolidBlockingBlock, and the
+          // vtable slot numbers 31/32 of ClientInstance, come from the open-source mod
+          // BedrockTools (MIT License, Copyright (c) 2026 RadiantByte). See THIRD_PARTY.txt.
           //
-          // How it hooks: Minecraft imports a few FMOD functions from libfmod.so. We swap
-          // the entries in libminecraftpe.so's GOT (import table) for our own functions.
+          // What it does:
+          //   1. Air absorption: 3D sounds get muffled with distance.
+          //   2. Wall occlusion: a ray from your ear to the sound source counts the solid
+          //      blocks in between; more blocks = more muffled.
+          //   3. Room reverb: rays in 16 directions measure how enclosed you are and how big
+          //      the space is; enclosed + big = long cave-like reverb, open sky = almost none.
+          //      (If world access is unavailable it falls back to a depth-based guess.)
+          //
+          // How it hooks (no code patching, only pointer swaps):
+          //   - FMOD functions imported by libminecraftpe.so: swap the GOT entries.
+          //   - ClientInstance::getLocalPlayer: swap its slot in the ClientInstance vtable.
+          //     That gives us the ClientInstance (-> BlockSource) on the game thread, and a
+          //     safe place to run world queries.
 
           #include <android/log.h>
           #include <dlfcn.h>
           #include <elf.h>
+          #include <fcntl.h>
+          #include <jni.h>
           #include <link.h>
           #include <sys/mman.h>
           #include <unistd.h>
 
           #include <atomic>
-          #include <cstdarg>
-          #include <cstdio>
-          #include <jni.h>
-          #include <string>
-          #include <vector>
           #include <chrono>
           #include <cmath>
+          #include <cstdarg>
           #include <cstdint>
+          #include <cstdio>
           #include <cstring>
           #include <mutex>
+          #include <string>
           #include <thread>
           #include <unordered_map>
-          #include <unordered_set>
+          #include <vector>
 
           #define TAG "SoundPhysicsLite"
+          #define SPL_BUILD 4
 
-          // Log to logcat AND to spl_log.txt (several candidate folders) so problems can
-          // be diagnosed without a PC.
+          // ---------------------------------------------------------------- logging
           static void spl_log(const char* fmt, ...) {
             char buf[600];
             va_list ap;
@@ -96,35 +138,45 @@ jobs:
           #define LOGI(...) spl_log(__VA_ARGS__)
           #define LOGW(...) spl_log(__VA_ARGS__)
 
-          static std::atomic<unsigned> c_listener{0}, c_play{0}, c_set3D{0};
-          static bool shouldLog(std::atomic<unsigned>& c) {
+          static std::atomic<unsigned> c_listener{0}, c_play{0}, c_set3D{0}, c_tick{0};
+          static bool shouldLog(std::atomic<unsigned>& c, unsigned every = 3000) {
             unsigned n = ++c;
-            return n <= 3 || n % 3000 == 0;
+            return n <= 3 || n % every == 0;
           }
 
           // ---------------------------------------------------------------- settings
           namespace cfg {
-          // Air absorption (distances are in blocks)
+          // Air absorption (distances in blocks)
           constexpr bool  kAirAbsorption   = true;
-          constexpr float kAirStart        = 2.0f;   // no muffling closer than this
-          constexpr float kAirFull         = 16.0f;  // max muffling at/after this
-          constexpr float kAirMax          = 0.85f;  // 0..1, FMOD direct occlusion at max
-          constexpr float kAirCurve        = 1.0f;   // >1 = muffling grows slowly at first
-          constexpr float kReverbOccFactor = 0.25f;  // how much of the above hits the reverb path
+          constexpr float kAirStart        = 2.0f;
+          constexpr float kAirFull         = 16.0f;
+          constexpr float kAirMax          = 0.70f;
+          constexpr float kAirCurve        = 1.0f;
+          constexpr float kReverbOccFactor = 0.35f;  // share of the occlusion applied to the reverb path
 
-          // Depth reverb (Y coordinate in blocks)
-          constexpr bool  kDepthReverb     = true;
-          constexpr float kSurfaceY        = 60.0f;  // at/above this: surface reverb
-          constexpr float kCaveY           = 35.0f;  // at/below this: full cave reverb
-          constexpr float kWetSurfaceDb    = -28.0f; // reverb level at surface (dB, -80..20)
-          constexpr float kWetCaveDb       = -9.0f;  // reverb level deep underground (dB)
-          constexpr float kDecaySurfaceMs  = 900.0f;
+          // Wall occlusion (needs world access)
+          constexpr bool  kWallOcclusion   = true;
+          constexpr float kWallPerBlock    = 0.28f;  // muffling added per solid block on the ray
+          constexpr float kWallMax         = 0.92f;
+          constexpr int   kWallMaxBlocks   = 5;
+
+          // Room reverb (needs world access, otherwise depth fallback below)
+          constexpr bool  kRoomReverb      = true;
+          constexpr float kRayLen          = 20.0f;  // how far the enclosure rays look
+          constexpr float kSkyRayLen       = 48.0f;
+          constexpr float kSkyDamping      = 0.55f;  // open sky reduces enclosure to this fraction
+          constexpr float kWetOpenDb       = -38.0f;
+          constexpr float kWetEnclosedDb   = -8.0f;
+          constexpr float kDecayMinMs      = 450.0f;   // small room
+          constexpr float kDecayMaxMs      = 3600.0f;  // big cavern
+
+          // Fallback when world access is unavailable (Y in blocks)
+          constexpr float kSurfaceY        = 60.0f;
+          constexpr float kCaveY           = 35.0f;
           constexpr float kDecayCaveMs     = 3400.0f;
           }  // namespace cfg
 
           // ---------------------------------------------------------------- FMOD ABI
-          // Only the tiny part of the FMOD C++ ABI that we need. Member functions on
-          // AArch64 take `this` as the first argument, so plain function pointers work.
           typedef int FMOD_RESULT;
           struct FMOD_VECTOR { float x, y, z; };
           struct FMOD_REVERB_PROPERTIES {
@@ -141,7 +193,6 @@ jobs:
           typedef FMOD_RESULT (*Fn_ChReverb)(void*, int, float);
           typedef FMOD_RESULT (*Fn_GetMaster)(void*, void**);
 
-          // Originals (filled in when we patch the GOT) and helpers (found via dlsym).
           static Fn_Listener  o_listener = nullptr;
           static Fn_Play      o_play     = nullptr;
           static Fn_Set3DAttr o_set3D    = nullptr;
@@ -150,21 +201,352 @@ jobs:
           static Fn_ChReverb  f_chReverb   = nullptr;
           static Fn_GetMaster f_getMaster  = nullptr;
 
-          // ---------------------------------------------------------------- state
+          // ---------------------------------------------------------------- shared state
+          static inline uint64_t nowMs() {
+            return (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+                       std::chrono::steady_clock::now().time_since_epoch()).count();
+          }
+          static inline float clamp01(float v) { return v < 0 ? 0 : (v > 1 ? 1 : v); }
+          static inline float lerp(float a, float b, float t) { return a + (b - a) * t; }
+
+          struct Src {
+            FMOD_VECTOR pos{0, 0, 0};
+            uint64_t seen = 0;
+            float wall = 0.0f;  // smoothed wall occlusion (0..1), written by the game-thread tick
+            bool init = false;
+          };
+
           static std::mutex g_mu;
           static FMOD_VECTOR g_lis = {0, 0, 0};
-          static std::atomic<bool> g_hasLis{false};
-          static std::unordered_set<void*> g_known;   // channels already seen with 3D attrs
-          static std::unordered_set<void*> g_groups;  // channel groups already silenced for reverb
+          static bool g_hasLis = false;
+          static std::unordered_map<void*, Src> g_src;
+          static std::unordered_map<void*, bool> g_groups;
           static bool g_masterDone = false;
           static bool g_reverbOk = false;
 
+          // Room analysis results (written on the game thread, read by the audio hook)
+          static std::atomic<bool>  g_haveRoom{false};
+          static std::atomic<float> g_enclosure{0.0f};
+          static std::atomic<float> g_meanHit{20.0f};
+          static std::atomic<bool>  g_skyOpen{true};
+
           static float g_cave = 0.0f;
           static float g_lastCave = -1.0f;
-          static std::chrono::steady_clock::time_point g_lastRev{};
+          static uint64_t g_lastRev = 0;
 
-          static inline float clamp01(float v) { return v < 0 ? 0 : (v > 1 ? 1 : v); }
-          static inline float lerp(float a, float b, float t) { return a + (b - a) * t; }
+          // ---------------------------------------------------------------- Minecraft world access
+          struct BlockPos { int x, y, z; };
+          typedef bool (*IsSolidFn)(void* region, const BlockPos* pos);
+          typedef void* (*GetLPFn)(void* clientInstance);
+          typedef void* (*GetRegionFn)(void* clientInstance);
+
+          static IsSolidFn g_isSolid = nullptr;
+          static GetLPFn   o_getLP = nullptr;
+          static std::atomic<bool> g_worldReady{false};
+          static uintptr_t g_vtable0 = 0;  // address of slot 0 of the ClientInstance vtable
+          static uintptr_t g_libLo = 0, g_libHi = 0;
+
+          struct Seg { uintptr_t lo, hi; };
+          static std::vector<Seg> g_execSegs, g_rwSegs;
+          static uintptr_t g_bias = 0;
+
+          // Memory probe that never crashes: write() reports EFAULT for bad addresses.
+          static bool readable(const void* p, size_t n) {
+            if (!p || n == 0 || n > 64) return false;
+            static std::mutex m;
+            std::lock_guard<std::mutex> lk(m);
+            static int fds[2] = {-1, -1};
+            if (fds[0] < 0 && pipe2(fds, O_NONBLOCK | O_CLOEXEC) != 0) return false;
+            ssize_t w = write(fds[1], p, n);
+            if (w < 0) return false;
+            char sink[64];
+            ssize_t left = w;
+            while (left > 0) {
+              ssize_t r = read(fds[0], sink, sizeof sink);
+              if (r <= 0) break;
+              left -= r;
+            }
+            return w == (ssize_t)n;
+          }
+
+          static bool validRegion(void* r) {
+            if (!r || !readable(r, 8)) return false;
+            uintptr_t vt = *(uintptr_t*)r;
+            return vt >= g_libLo && vt < g_libHi;
+          }
+
+          // Walk the blocks along a -> b (voxel traversal). Returns the number of solid blocks
+          // crossed, excluding the start and end block, stopping after `stopAfter`.
+          // *firstHit receives the distance to the first solid block (if any).
+          static int trace(void* region, FMOD_VECTOR a, FMOD_VECTOR b, int stopAfter, float* firstHit) {
+            float dx = b.x - a.x, dy = b.y - a.y, dz = b.z - a.z;
+            float len = std::sqrt(dx * dx + dy * dy + dz * dz);
+            if (len < 1e-4f) return 0;
+            int x = (int)std::floor(a.x), y = (int)std::floor(a.y), z = (int)std::floor(a.z);
+            const int ex = (int)std::floor(b.x), ey = (int)std::floor(b.y), ez = (int)std::floor(b.z);
+            const float INF = 1e30f;
+            int sx = dx > 0 ? 1 : (dx < 0 ? -1 : 0);
+            int sy = dy > 0 ? 1 : (dy < 0 ? -1 : 0);
+            int sz = dz > 0 ? 1 : (dz < 0 ? -1 : 0);
+            float tdx = sx ? std::fabs(1.0f / dx) : INF;
+            float tdy = sy ? std::fabs(1.0f / dy) : INF;
+            float tdz = sz ? std::fabs(1.0f / dz) : INF;
+            float tmx = sx > 0 ? ((x + 1) - a.x) / dx : (sx < 0 ? (a.x - x) / -dx : INF);
+            float tmy = sy > 0 ? ((y + 1) - a.y) / dy : (sy < 0 ? (a.y - y) / -dy : INF);
+            float tmz = sz > 0 ? ((z + 1) - a.z) / dz : (sz < 0 ? (a.z - z) / -dz : INF);
+            int maxSteps = std::abs(ex - x) + std::abs(ey - y) + std::abs(ez - z) + 3;
+            int count = 0;
+            for (int i = 0; i < maxSteps; i++) {
+              float t;
+              if (tmx < tmy && tmx < tmz) { x += sx; t = tmx; tmx += tdx; }
+              else if (tmy < tmz)         { y += sy; t = tmy; tmy += tdy; }
+              else                        { z += sz; t = tmz; tmz += tdz; }
+              if (t > 1.0f) break;
+              if (x == ex && y == ey && z == ez) break;
+              BlockPos bp{x, y, z};
+              if (g_isSolid(region, &bp)) {
+                if (count == 0 && firstHit) *firstHit = t * len;
+                if (++count >= stopAfter) break;
+              }
+            }
+            return count;
+          }
+
+          static float wallOcclusion(void* region, const FMOD_VECTOR& ear, const FMOD_VECTOR& src) {
+            int n = trace(region, ear, src, cfg::kWallMaxBlocks, nullptr);
+            float w = n * cfg::kWallPerBlock;
+            return w > cfg::kWallMax ? cfg::kWallMax : w;
+          }
+
+          static void computeRoom(void* region, const FMOD_VECTOR& o) {
+            static FMOD_VECTOR dirs[16];
+            static bool init = false;
+            if (!init) {
+              init = true;
+              const float v[16][3] = {{1, 0, 0}, {-1, 0, 0}, {0, 0, 1}, {0, 0, -1}, {0, 1, 0}, {0, -1, 0},
+                                      {1, 0, 1}, {1, 0, -1}, {-1, 0, 1}, {-1, 0, -1},
+                                      {1, 1, 0}, {-1, 1, 0}, {0, 1, 1}, {0, 1, -1},
+                                      {1, -1, 0}, {-1, -1, 0}};
+              for (int i = 0; i < 16; i++) {
+                float l = std::sqrt(v[i][0] * v[i][0] + v[i][1] * v[i][1] + v[i][2] * v[i][2]);
+                dirs[i] = {v[i][0] / l, v[i][1] / l, v[i][2] / l};
+              }
+            }
+            int hits = 0;
+            float sumD = 0;
+            for (int i = 0; i < 16; i++) {
+              FMOD_VECTOR e = {o.x + dirs[i].x * cfg::kRayLen, o.y + dirs[i].y * cfg::kRayLen,
+                               o.z + dirs[i].z * cfg::kRayLen};
+              float hd = cfg::kRayLen;
+              if (trace(region, o, e, 1, &hd) > 0) { hits++; sumD += hd; }
+            }
+            FMOD_VECTOR up = {o.x, o.y + cfg::kSkyRayLen, o.z};
+            bool sky = trace(region, o, up, 1, nullptr) == 0;
+            float e = hits / 16.0f;
+            float mean = hits ? sumD / hits : cfg::kRayLen;
+            float pe = g_enclosure.load(), pm = g_meanHit.load();
+            if (!g_haveRoom.load()) { pe = e; pm = mean; }
+            g_enclosure = pe + (e - pe) * 0.35f;
+            g_meanHit = pm + (mean - pm) * 0.35f;
+            g_skyOpen = sky;
+            g_haveRoom = true;
+          }
+
+          // Runs on the game thread (inside the getLocalPlayer vtable hook), at most every 50 ms.
+          static uint64_t g_lastTick = 0, g_lastRoom = 0;
+          static void gameTick(void* ci) {
+            uint64_t t = nowMs();
+            if (t - g_lastTick < 50) return;
+            g_lastTick = t;
+            if (!readable(ci, 8) || *(uintptr_t*)ci != g_vtable0) {
+              static bool warned = false;
+              if (!warned) { warned = true; LOGW("tick: ClientInstance vptr mismatch (%p)", ci); }
+              return;
+            }
+            void* region = ((GetRegionFn)((void**)g_vtable0)[31])(ci);
+            if (!validRegion(region)) {
+              static unsigned bad = 0;
+              if (++bad <= 3) LOGW("tick: region invalid (%p)", region);
+              return;
+            }
+            FMOD_VECTOR lis;
+            struct S { void* ch; FMOD_VECTOR pos; };
+            S snap[32];
+            int n = 0;
+            {
+              std::lock_guard<std::mutex> lk(g_mu);
+              if (!g_hasLis) return;
+              lis = g_lis;
+              for (auto it = g_src.begin(); it != g_src.end();) {
+                if (t - it->second.seen > 3000) { it = g_src.erase(it); continue; }
+                if (n < 32) snap[n++] = {it->first, it->second.pos};
+                ++it;
+              }
+            }
+            float res[32];
+            if (cfg::kWallOcclusion) {
+              for (int i = 0; i < n; i++) res[i] = wallOcclusion(region, lis, snap[i].pos);
+              std::lock_guard<std::mutex> lk(g_mu);
+              for (int i = 0; i < n; i++) {
+                auto it = g_src.find(snap[i].ch);
+                if (it != g_src.end()) it->second.wall += (res[i] - it->second.wall) * 0.5f;
+              }
+            }
+            if (cfg::kRoomReverb && t - g_lastRoom >= 250) {
+              g_lastRoom = t;
+              computeRoom(region, lis);
+            }
+            if (shouldLog(c_tick, 400))
+              LOGI("tick#%u lis=(%.1f,%.1f,%.1f) sources=%d wall0=%.2f enclosure=%.2f meanHit=%.1f sky=%d",
+                   c_tick.load(), lis.x, lis.y, lis.z, n, (cfg::kWallOcclusion && n) ? res[0] : 0.f,
+                   g_enclosure.load(), g_meanHit.load(), (int)g_skyOpen.load());
+          }
+
+          static void* hk_getLP(void* self) {
+            void* r = o_getLP(self);
+            static thread_local bool busy = false;
+            if (!busy && g_worldReady.load()) {
+              busy = true;
+              gameTick(self);
+              busy = false;
+            }
+            return r;
+          }
+
+          // ---------------------------------------------------------------- signature scanning
+          struct Pat {
+            std::vector<uint8_t> b, m;  // bytes and mask (1 = must match)
+            size_t anchorOff = 0, anchorLen = 0;
+          };
+
+          static bool parsePat(const char* s, Pat& p) {
+            p.b.clear();
+            p.m.clear();
+            while (*s) {
+              while (*s == ' ') s++;
+              if (!*s) break;
+              if (*s == '?') {
+                p.b.push_back(0);
+                p.m.push_back(0);
+                s++;
+                while (*s == '?') s++;
+              } else {
+                char tmp[3] = {s[0], s[1], 0};
+                p.b.push_back((uint8_t)strtoul(tmp, nullptr, 16));
+                p.m.push_back(1);
+                s += 2;
+              }
+            }
+            size_t best = 0, bestStart = 0, cur = 0, start = 0;
+            for (size_t i = 0; i <= p.b.size(); i++) {
+              if (i == p.b.size() || !p.m[i]) {
+                if (cur > best) { best = cur; bestStart = start; }
+                cur = 0;
+                start = i + 1;
+              } else {
+                if (cur == 0) start = i;
+                cur++;
+              }
+            }
+            p.anchorOff = bestStart;
+            p.anchorLen = best;
+            return best >= 3 && !p.b.empty();
+          }
+
+          static const uint8_t* findPat(const uint8_t* base, size_t n, const Pat& p, int* count = nullptr) {
+            const uint8_t* end = base + n;
+            const uint8_t* pos = base;
+            const uint8_t* first = nullptr;
+            int found = 0;
+            while (pos < end) {
+              const uint8_t* hit = (const uint8_t*)memmem(pos, (size_t)(end - pos), &p.b[p.anchorOff], p.anchorLen);
+              if (!hit) break;
+              const uint8_t* st = hit - p.anchorOff;
+              if (st >= base && st + p.b.size() <= end) {
+                bool ok = true;
+                for (size_t i = 0; i < p.b.size(); i++)
+                  if (p.m[i] && st[i] != p.b[i]) { ok = false; break; }
+                if (ok) {
+                  if (!first) first = st;
+                  found++;
+                  if (found >= 2) break;
+                }
+              }
+              pos = hit + 1;
+            }
+            if (count) *count = found;
+            return first;
+          }
+
+          static uintptr_t scanExec(const char* pattern, int* count) {
+            Pat p;
+            if (!parsePat(pattern, p)) return 0;
+            uintptr_t result = 0;
+            int total = 0;
+            for (auto& s : g_execSegs) {
+              int c = 0;
+              const uint8_t* r = findPat((const uint8_t*)s.lo, s.hi - s.lo, p, &c);
+              total += c;
+              if (r && !result) result = (uintptr_t)r;
+            }
+            if (count) *count = total;
+            return result;
+          }
+
+          // Patterns from BedrockTools (MIT, (c) 2026 RadiantByte); see THIRD_PARTY.txt.
+          static const char* kSigGetLocalPlayer =
+              "? ? ? D1 ? ? ? A9 ? ? ? F9 ? ? ? 91 53 D0 3B D5 E8 03 00 AA ? ? ? 91 ? ? ? F9 ? ? ? 91 ? ? ? F8 "
+              "? ? ? 95 ? ? ? 91 ? ? ? 95 ? ? ? 36 ? ? ? 91 ? ? ? 52 ? ? ? 94";
+          static const char* kSigIsSolidBlocking = "? ? ? F9 ? ? ? B9 ? ? ? 29 ? ? ? F9 E1 03 08 2A";
+          constexpr size_t kSlotGetRegion = 31, kSlotGetLocalPlayer = 32;
+
+          static void writeSlot(void** slot, void* value) {
+            long page = sysconf(_SC_PAGESIZE);
+            uintptr_t start = (uintptr_t)slot & ~(uintptr_t)(page - 1);
+            mprotect((void*)start, page, PROT_READ | PROT_WRITE);
+            *slot = value;
+          }
+
+          static bool inExec(uintptr_t v) {
+            for (auto& s : g_execSegs)
+              if (v >= s.lo && v < s.hi) return true;
+            return false;
+          }
+
+          static void worldInit() {
+            uint64_t t0 = nowMs();
+            int cLP = 0, cSolid = 0;
+            uintptr_t aLP = scanExec(kSigGetLocalPlayer, &cLP);
+            uintptr_t aSolid = scanExec(kSigIsSolidBlocking, &cSolid);
+            LOGI("world: getLocalPlayer=%p (matches>=%d) isSolidBlocking=%p (matches>=%d) scan=%llums",
+                 (void*)aLP, cLP, (void*)aSolid, cSolid, (unsigned long long)(nowMs() - t0));
+            if (!aLP || !aSolid) { LOGW("world: signatures not found, world features OFF"); return; }
+
+            std::vector<uintptr_t*> hits;
+            for (auto& s : g_rwSegs) {
+              uintptr_t* w = (uintptr_t*)((s.lo + 7) & ~(uintptr_t)7);
+              uintptr_t* e = (uintptr_t*)(s.hi & ~(uintptr_t)7);
+              for (; w < e; w++)
+                if (*w == aLP) hits.push_back(w);
+            }
+            LOGI("world: vtable slots referencing getLocalPlayer: %d", (int)hits.size());
+            uintptr_t* slot = nullptr;
+            for (auto* h : hits) {
+              // plausibility: neighbours in the vtable must be function pointers into the code
+              if (inExec(h[-1]) && inExec(h[1]) && inExec(*(h - (int)kSlotGetLocalPlayer))) { slot = h; break; }
+            }
+            if (!slot) { LOGW("world: no plausible vtable slot, world features OFF"); return; }
+            g_vtable0 = (uintptr_t)(slot - kSlotGetLocalPlayer);
+            void* getRegionFn = ((void**)g_vtable0)[kSlotGetRegion];
+            LOGI("world: vtable0=%p slot32=%p getRegion(slot31)=%p", (void*)g_vtable0, (void*)slot, getRegionFn);
+            if (!inExec((uintptr_t)getRegionFn)) { LOGW("world: slot 31 not a function, world features OFF"); return; }
+
+            g_isSolid = (IsSolidFn)aSolid;
+            o_getLP = (GetLPFn)aLP;
+            writeSlot((void**)slot, (void*)hk_getLP);
+            g_worldReady = true;
+            LOGI("world: vtable hook installed, world features ON");
+          }
 
           // ---------------------------------------------------------------- effects
           static float airOcclusion(float dist) {
@@ -174,18 +556,28 @@ jobs:
           }
 
           static void updateReverb(void* sys, float listenerY) {
-            if (!g_reverbOk || !cfg::kDepthReverb || !f_sysReverb) return;
-            auto now = std::chrono::steady_clock::now();
-            if (now - g_lastRev < std::chrono::milliseconds(250)) return;
+            if (!g_reverbOk || !f_sysReverb) return;
+            uint64_t now = nowMs();
+            if (now - g_lastRev < 250) return;
             g_lastRev = now;
 
-            float target = clamp01((cfg::kSurfaceY - listenerY) / (cfg::kSurfaceY - cfg::kCaveY));
-            g_cave += (target - g_cave) * 0.3f;  // smooth transition
+            float target, decayRoom;
+            if (cfg::kRoomReverb && g_haveRoom.load()) {
+              float e = g_enclosure.load();
+              if (g_skyOpen.load()) e *= cfg::kSkyDamping;
+              target = clamp01(e);
+              float size = clamp01((g_meanHit.load() - 1.5f) / 12.0f);
+              decayRoom = lerp(cfg::kDecayMinMs, cfg::kDecayMaxMs, size);
+            } else {
+              target = clamp01((cfg::kSurfaceY - listenerY) / (cfg::kSurfaceY - cfg::kCaveY));
+              decayRoom = cfg::kDecayCaveMs;
+            }
+            g_cave += (target - g_cave) * 0.3f;
             if (std::fabs(g_cave - g_lastCave) < 0.02f && g_lastCave >= 0) return;
             g_lastCave = g_cave;
 
             FMOD_REVERB_PROPERTIES p;
-            p.DecayTime         = lerp(cfg::kDecaySurfaceMs, cfg::kDecayCaveMs, g_cave);
+            p.DecayTime         = lerp(250.0f, decayRoom, g_cave);
             p.EarlyDelay        = lerp(7.0f, 12.0f, g_cave);
             p.LateDelay         = lerp(11.0f, 25.0f, g_cave);
             p.HFReference       = 5000.0f;
@@ -196,13 +588,15 @@ jobs:
             p.LowShelfGain      = 0.0f;
             p.HighCut           = 20000.0f;
             p.EarlyLateMix      = 70.0f;
-            p.WetLevel          = lerp(cfg::kWetSurfaceDb, cfg::kWetCaveDb, g_cave);
+            p.WetLevel          = lerp(cfg::kWetOpenDb, cfg::kWetEnclosedDb, std::pow(g_cave, 1.1f));
             FMOD_RESULT rr = f_sysReverb(sys, 0, &p);
-            LOGI("reverb update: y=%.1f cave=%.2f wet=%.1fdB decay=%.0fms result=%d", listenerY,
-                 g_cave, p.WetLevel, p.DecayTime, rr);
+            static unsigned logged = 0;
+            if (++logged <= 6 || logged % 40 == 0)
+              LOGI("reverb: cave=%.2f wet=%.1fdB decay=%.0fms world=%d result=%d", g_cave, p.WetLevel,
+                   p.DecayTime, (int)g_haveRoom.load(), rr);
           }
 
-          // ---------------------------------------------------------------- hooks
+          // ---------------------------------------------------------------- FMOD hooks
           static FMOD_RESULT hk_listener(void* sys, int idx, const FMOD_VECTOR* pos,
                                          const FMOD_VECTOR* vel, const FMOD_VECTOR* fwd,
                                          const FMOD_VECTOR* up) {
@@ -211,14 +605,12 @@ jobs:
               LOGI("listener#%u idx=%d pos=(%.1f,%.1f,%.1f)", c_listener.load(), idx,
                    pos ? pos->x : 0.f, pos ? pos->y : 0.f, pos ? pos->z : 0.f);
             if (idx == 0 && pos && !(pos->x == 0.0f && pos->y == 0.0f && pos->z == 0.0f)) {
-              float y;
               {
                 std::lock_guard<std::mutex> lk(g_mu);
                 g_lis = *pos;
-                y = pos->y;
+                g_hasLis = true;
               }
-              g_hasLis = true;
-              updateReverb(sys, y);
+              updateReverb(sys, pos->y);
             }
             return r;
           }
@@ -227,12 +619,11 @@ jobs:
             FMOD_RESULT r = o_play(sys, snd, grp, paused, chOut);
             if (shouldLog(c_play)) LOGI("playSound#%u result=%d", c_play.load(), r);
             if (g_reverbOk && f_chReverb) {
-              // Make sure ONLY channels that get 3D attributes feed the reverb
-              // (keeps music and UI sounds clean).
+              // Only channels that receive 3D attributes feed the reverb (keeps music/UI dry).
               bool silenceGroup = false, silenceMaster = false;
               {
                 std::lock_guard<std::mutex> lk(g_mu);
-                if (grp && g_groups.insert(grp).second) silenceGroup = true;
+                if (grp && g_groups.emplace(grp, true).second) silenceGroup = true;
                 if (!g_masterDone && f_getMaster) { g_masterDone = true; silenceMaster = true; }
               }
               if (silenceGroup) f_chReverb(grp, 0, 0.0f);
@@ -244,7 +635,7 @@ jobs:
                 void* ch = *chOut;
                 {
                   std::lock_guard<std::mutex> lk(g_mu);
-                  g_known.erase(ch);
+                  g_src.erase(ch);
                 }
                 f_chReverb(ch, 0, 0.0f);
               }
@@ -254,26 +645,33 @@ jobs:
 
           static FMOD_RESULT hk_set3D(void* ch, const FMOD_VECTOR* pos, const FMOD_VECTOR* vel) {
             FMOD_RESULT r = o_set3D(ch, pos, vel);
-            if (pos && g_hasLis.load()) {
-              FMOD_VECTOR lis;
-              bool first;
-              {
-                std::lock_guard<std::mutex> lk(g_mu);
-                lis = g_lis;
-                first = g_known.insert(ch).second;
-                if (g_known.size() > 4096) g_known.clear();
-              }
-              if (first && g_reverbOk && f_chReverb) f_chReverb(ch, 0, 1.0f);
-              if (cfg::kAirAbsorption && f_occ) {
-                float dx = pos->x - lis.x, dy = pos->y - lis.y, dz = pos->z - lis.z;
-                float dist = std::sqrt(dx * dx + dy * dy + dz * dz);
-                float occ = airOcclusion(dist);
-                FMOD_RESULT orr = f_occ(ch, occ, occ * cfg::kReverbOccFactor);
-                if (shouldLog(c_set3D))
-                  LOGI("set3D#%u dist=%.1f occ=%.2f occResult=%d", c_set3D.load(), dist, occ, orr);
-              } else if (shouldLog(c_set3D)) {
-                LOGI("set3D#%u (no occlusion fn)", c_set3D.load());
-              }
+            if (!pos) return r;
+            FMOD_VECTOR lis;
+            float wall;
+            bool first, hasLis;
+            {
+              std::lock_guard<std::mutex> lk(g_mu);
+              hasLis = g_hasLis;
+              lis = g_lis;
+              if (g_src.size() > 4096) g_src.clear();
+              Src& s = g_src[ch];
+              first = !s.init;
+              s.init = true;
+              s.pos = *pos;
+              s.seen = nowMs();
+              wall = s.wall;
+            }
+            if (!hasLis) return r;
+            if (first && g_reverbOk && f_chReverb) f_chReverb(ch, 0, 1.0f);
+            if (cfg::kAirAbsorption && f_occ) {
+              float dx = pos->x - lis.x, dy = pos->y - lis.y, dz = pos->z - lis.z;
+              float dist = std::sqrt(dx * dx + dy * dy + dz * dz);
+              float air = airOcclusion(dist);
+              float occ = 1.0f - (1.0f - air) * (1.0f - wall);
+              FMOD_RESULT orr = f_occ(ch, occ, occ * cfg::kReverbOccFactor);
+              if (shouldLog(c_set3D))
+                LOGI("set3D#%u dist=%.1f air=%.2f wall=%.2f occ=%.2f result=%d", c_set3D.load(), dist, air,
+                     wall, occ, orr);
             }
             return r;
           }
@@ -296,24 +694,27 @@ jobs:
           };
           constexpr int kNumHooks = sizeof(g_hooks) / sizeof(g_hooks[0]);
 
-          static void writeSlot(void** slot, void* value) {
-            long page = sysconf(_SC_PAGESIZE);
-            uintptr_t start = (uintptr_t)slot & ~(uintptr_t)(page - 1);
-            mprotect((void*)start, page, PROT_READ | PROT_WRITE);
-            *slot = value;
-          }
-
           static int phdrCallback(struct dl_phdr_info* info, size_t, void* data) {
             const char* name = info->dlpi_name;
             if (!name || !strstr(name, "libminecraftpe.so")) return 0;
 
             uintptr_t bias = info->dlpi_addr;
             LOGI("found module: %s bias=%p", name, (void*)bias);
+            g_bias = bias;
+            g_execSegs.clear();
+            g_rwSegs.clear();
+            g_libLo = (uintptr_t)-1;
+            g_libHi = 0;
             const ElfW(Dyn)* dyn = nullptr;
             for (int i = 0; i < info->dlpi_phnum; i++) {
-              if (info->dlpi_phdr[i].p_type == PT_DYNAMIC) {
-                dyn = (const ElfW(Dyn)*)(bias + info->dlpi_phdr[i].p_vaddr);
-                break;
+              const ElfW(Phdr)& ph = info->dlpi_phdr[i];
+              if (ph.p_type == PT_DYNAMIC) dyn = (const ElfW(Dyn)*)(bias + ph.p_vaddr);
+              if (ph.p_type == PT_LOAD) {
+                uintptr_t lo = bias + ph.p_vaddr, hi = lo + ph.p_memsz;
+                if (lo < g_libLo) g_libLo = lo;
+                if (hi > g_libHi) g_libHi = hi;
+                if (ph.p_flags & PF_X) g_execSegs.push_back({lo, hi});
+                if (ph.p_flags & PF_W) g_rwSegs.push_back({lo, hi});
               }
             }
             if (!dyn) return 0;
@@ -343,8 +744,7 @@ jobs:
               size_t n = bytes / sizeof(ElfW(Rela));
               for (size_t i = 0; i < n; i++) {
                 uint32_t type = ELF64_R_TYPE(tab[i].r_info);
-                // 1025 = GLOB_DAT, 1026 = JUMP_SLOT, 257 = ABS64 (AArch64)
-                if (type != 1025 && type != 1026 && type != 257) continue;
+                if (type != 1025 && type != 1026 && type != 257) continue;  // GLOB_DAT, JUMP_SLOT, ABS64
                 uint32_t si = ELF64_R_SYM(tab[i].r_info);
                 if (!si) continue;
                 const char* nm = strtab + symtab[si].st_name;
@@ -373,14 +773,14 @@ jobs:
             return p;
           }
 
-          static std::atomic<bool> g_installed{false};
-
           static int listCallback(struct dl_phdr_info* info, size_t, void*) {
             const char* n = info->dlpi_name;
             if (n && (strstr(n, "fmod") || strstr(n, "minecraft") || strstr(n, "soundphysics")))
               LOGI("loaded lib: %s", n);
             return 0;
           }
+
+          static std::atomic<bool> g_installed{false};
 
           static bool tryInstall() {
             if (g_installed.load()) return true;
@@ -399,24 +799,18 @@ jobs:
               if (g_hooks[h].done && *g_hooks[h].orig) ok++;
               else LOGW("hook not installed: %s", g_hooks[h].sym);
             }
-            if (ok < kNumHooks) {
-              // Safety: if the set is incomplete, put everything back to a consistent state
-              // by leaving whatever got patched (each hook forwards to the original anyway).
-              LOGW("only %d/%d hooks installed", ok, kNumHooks);
-            }
 
             f_occ       = (Fn_Set3DOcc)findFmod("_ZN4FMOD14ChannelControl14set3DOcclusionEff");
             f_sysReverb = (Fn_SysReverb)findFmod("_ZN4FMOD6System19setReverbPropertiesEiPK22FMOD_REVERB_PROPERTIES");
             f_chReverb  = (Fn_ChReverb)findFmod("_ZN4FMOD14ChannelControl19setReverbPropertiesEif");
             f_getMaster = (Fn_GetMaster)findFmod("_ZN4FMOD6System21getMasterChannelGroupEPPNS_12ChannelGroupE");
 
-            // Reverb is only enabled if everything needed to keep music/UI dry is available.
             g_reverbOk = f_sysReverb && f_chReverb && f_getMaster && o_play && o_set3D && o_listener;
             LOGI("installed: hooks=%d/%d occlusion=%s reverb=%s", ok, kNumHooks,
                  f_occ ? "yes" : "NO", g_reverbOk ? "yes" : "NO");
-            LOGI("fn ptrs: occ=%p sysReverb=%p chReverb=%p master=%p", (void*)f_occ,
-                 (void*)f_sysReverb, (void*)f_chReverb, (void*)f_getMaster);
             g_installed = true;
+
+            std::thread(worldInit).detach();  // signature scan takes a moment; keep loading fast
             return true;
           }
 
@@ -428,10 +822,11 @@ jobs:
             if (!g_installed.load()) LOGW("libminecraftpe.so not found, giving up");
           }
 
+          #ifndef SPL_TEST
           static std::atomic<bool> g_started{false};
           static void startOnce(const char* how) {
             if (g_started.exchange(true)) return;
-            LOGI("SoundPhysicsLite build 3 starting via %s (pid %d)", how, (int)getpid());
+            LOGI("SoundPhysicsLite build %d starting via %s (pid %d)", SPL_BUILD, how, (int)getpid());
             if (!tryInstall()) std::thread(retryThread).detach();
           }
 
@@ -441,6 +836,7 @@ jobs:
             startOnce("JNI_OnLoad");
             return JNI_VERSION_1_6;
           }
+          #endif
           EOF
       - name: Build (arm64-v8a)
         run: |
@@ -455,7 +851,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "build-${{ github.run_number }}" build/libsoundphysicslite.so \
+          gh release create "build-${{ github.run_number }}" build/libsoundphysicslite.so THIRD_PARTY.txt \
             --repo "${{ github.repository }}" \
             --title "SoundPhysicsLite build ${{ github.run_number }}" \
-            --notes "Import libsoundphysicslite.so into LeviLaunchroid."
+            --notes "Import libsoundphysicslite.so into LeviLaunchroid. Uses signatures from BedrockTools (MIT), see THIRD_PARTY.txt."
